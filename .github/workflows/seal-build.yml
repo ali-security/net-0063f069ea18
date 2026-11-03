@@ -1,0 +1,108 @@
+name: seal-build
+
+# golang.org/x/net ships no GitHub Actions CI upstream (Go's own builders test it).
+# This workflow packs the module zip exactly as proxy.golang.org serves it and runs
+# the module's full `go test ./...` suite on Linux, macOS and Windows.
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Package pattern(s) passed to go test (empty = ./...)'
+        required: false
+        default: ''
+
+jobs:
+  module-zip:
+    name: Module zip
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Build module-zip helper (golang.org/x/mod/zip)
+        shell: bash
+        run: |
+          set -eux
+          helper="$(mktemp -d)"
+          cp "$GITHUB_WORKSPACE/.github/create_mod.go" "$helper/"
+          cd "$helper"
+          go mod init example.com/mod
+          go get golang.org/x/mod@v0.24.0
+          go build -o "$RUNNER_TEMP/create_mod" .
+
+      - name: Pack module zip
+        shell: bash
+        run: |
+          set -eux
+          # The sealing workflow itself must not ship inside the module zip.
+          rm -rf "$GITHUB_WORKSPACE/.github"
+          mkdir -p "$RUNNER_TEMP/out"
+          "$RUNNER_TEMP/create_mod" golang.org/x/net v0.36.0 "$GITHUB_WORKSPACE" "$RUNNER_TEMP/out/v0.36.0.zip"
+          unzip -l "$RUNNER_TEMP/out/v0.36.0.zip" | tail -1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/out/v0.36.0.zip
+          if-no-files-found: error
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    env:
+      # internal/http3 test helpers are gated on goexperiment.synctest while other
+      # go1.24-tagged test files reference them; without it the package fails to build.
+      GOEXPERIMENT: synctest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Build
+        shell: bash
+        run: |
+          set -eux
+          go version
+          go build ./...
+
+      - name: Test
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -v ${{ inputs.test-filter || './...' }} 2>&1 | tee "$RUNNER_TEMP/go-test.log"
+
+      - name: Test summary
+        if: always()
+        shell: bash
+        run: |
+          awk '
+            /^ok[ \t]/            { ok++ }
+            /^FAIL[ \t]/          { failpkg++ }
+            /^--- PASS/ || /^[ \t]+--- PASS/ { pass++ }
+            /^--- FAIL/ || /^[ \t]+--- FAIL/ { fail++ }
+            /^--- SKIP/ || /^[ \t]+--- SKIP/ { skip++ }
+            END { printf "Test summary: packages ok=%d failed=%d; tests passed=%d failed=%d skipped=%d\n", ok, failpkg, pass, fail, skip }
+          ' "$RUNNER_TEMP/go-test.log"
+          echo "Skipped tests and reasons:"
+          # go test -v streams t.Skip messages under the test's "=== RUN/CONT" line,
+          # before its "--- SKIP" line (subtest results come later, grouped under the
+          # parent), so collect messages per test name and print them with each skip.
+          awk '
+            { sub(/\r$/, "") }
+            /^=== RUN/ { cur = $3; r[cur] = ""; next }
+            /^=== (CONT|NAME)/ { cur = $3; next }
+            /^[ \t]+[^ \t]+\.go:[0-9]+: / { msg = $0; sub(/^[ \t]+/, "", msg); r[cur] = (r[cur] == "" ? msg : r[cur] " | " msg); next }
+            /^[ \t]*--- SKIP: / { line = $0; sub(/^[ \t]+/, "", line); n = $3; printf "%s  reason: %s\n", line, (r[n] == "" ? "(no message logged)" : r[n]) }
+          ' "$RUNNER_TEMP/go-test.log"
